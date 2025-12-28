@@ -5,18 +5,19 @@ import json
 import time
 import re
 
-st.set_page_config(page_title="BDO Official Fixed", layout="wide")
+st.set_page_config(page_title="BDO Scanner (Official Fixed)", layout="wide")
 st.title("🛡️ BDO Global Scanner (Official Source Fixed)")
 
 # --- CONFIG ---
 # Initialize Cloudscraper to bypass Pearl Abyss security
 scraper = cloudscraper.create_scraper()
 
-# --- FIXED URLS (The source of the previous error) ---
+# --- FIXED URLS (CRITICAL FIX) ---
+# NA and EU regions require the '.naeu' subdomain
 REGIONS = {
-    "NA": "https://na-trade.playblackdesert.com",
-    "EU": "https://eu-trade.playblackdesert.com",
-    "SEA": "https://trade.sea.playblackdesert.com", # SEA uses a different format
+    "NA": "https://na-trade.naeu.playblackdesert.com",
+    "EU": "https://eu-trade.naeu.playblackdesert.com",
+    "SEA": "https://trade.sea.playblackdesert.com", 
     "KR": "https://trade.kr.playblackdesert.com"
 }
 
@@ -76,7 +77,6 @@ def get_official_tokens(base_url):
         if match:
             return match.group(1), "Success"
         else:
-            # Fallback: Sometimes it's not in the HTML if they detect a bot, but let's try just cookies
             return None, "Token not found in HTML (Bot detected?)"
             
     except Exception as e:
