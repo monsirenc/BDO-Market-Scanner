@@ -9,22 +9,39 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-st.set_page_config(page_title="BDO Tank Mode", layout="wide")
-st.title("🛡️ BDO Global Scanner (Tank Mode)")
+st.set_page_config(page_title="BDO Final Fix", layout="wide")
+st.title("🛡️ BDO Global Scanner (Safe Mode)")
+
+# --- CONFIG ---
+# KNOWN NON-MARKET ITEMS (Vendor items, trash, etc that crash the API)
+BLACKLIST_IDS = {
+    5600,  # Weeds
+    9059,  # Mineral Water
+    9001,  # Salt
+    9002,  # Sugar
+    9005,  # Leavening Agent
+    9017,  # Cooking Wine
+    9066,  # Vinegar (Craftable but sometimes glitchy on API?)
+    9016,  # Deep Frying Oil
+    9015,  # Olive Oil
+    9018,  # Base Sauce
+    6656,  # Purified Water (Keep just in case)
+    6655,  # Bottle of Clean Water
+}
 
 # --- SETTINGS ---
 col1, col2, col3 = st.columns(3)
 with col1:
     mastery = st.number_input("Mastery", 2000, step=50)
 with col2:
-    # Arsha V2 usually wants lowercase 'na', 'eu', etc.
-    region = st.selectbox("Region", ["na", "eu", "sea", "kr", "sa", "men", "ru", "jp"])
+    # V2 API usually works best with lowercase region
+    region = st.selectbox("Region", ["na", "eu", "sea", "kr", "sa", "ru", "jp"])
 with col3:
     min_stock = st.number_input("Min Stock", 0, step=10)
 
 tax = 0.845 
 
-# --- 1. DATA LOADER (UNCHANGED) ---
+# --- 1. DATA LOADER ---
 @st.cache_data
 def load_data_strict():
     db = []
@@ -52,94 +69,109 @@ def load_data_strict():
             log.append(f"❌ {f}: Failed - {e}")
     return db, log
 
-# --- 2. SINGLE ITEM FETCH (THE FIX) ---
-def fetch_single_item(session, pid, reg):
-    """
-    Fetches a single item. If it fails (500), it returns None 
-    so it doesn't crash the whole app.
-    """
-    url = f"https://api.arsha.io/v2/{reg}/price?id={pid}&lang=en"
-    try:
-        # verify=False is crucial for Streamlit Cloud
-        resp = session.get(url, timeout=5, verify=False)
-        if resp.status_code == 200:
-            data = resp.json()
-            # Arsha returns a LIST even for single items
-            if isinstance(data, list) and len(data) > 0:
-                item = data[0]
-                return {
-                    'id': int(item.get('id', 0)),
-                    'p': int(item.get('pricePerOne', 0)),
-                    's': int(item.get('currentStock', 0))
-                }
-    except:
-        pass
-    return None
-
-# --- 3. MARKET MANAGER (THREADED) ---
-def get_market_threaded(ids, reg):
+# --- 2. SMART API FETCH ---
+def get_market_smart(ids, reg):
     market = {}
-    id_list = list(set([int(i) for i in ids]))
+    # Filter out Blacklisted items immediately
+    safe_ids = list(set([int(i) for i in ids if int(i) not in BLACKLIST_IDS]))
     
-    # Session for connection pooling (faster)
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    })
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
     
-    # Progress UI
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    bar = st.progress(0)
+    status = st.empty()
     
-    # Use 10 threads to fetch fast but safely
-    total = len(id_list)
-    completed = 0
+    # Use small batches. If a batch fails, we fall back to single-fetch for that batch.
+    batch_size = 20
     
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        # Submit all tasks
-        futures = {executor.submit(fetch_single_item, session, pid, reg): pid for pid in id_list}
+    for i in range(0, len(safe_ids), batch_size):
+        batch = safe_ids[i:i+batch_size]
+        if not batch: continue
         
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                market[result['id']] = {'p': result['p'], 's': result['s']}
+        url = f"https://api.arsha.io/v2/{reg}/price?id={','.join(map(str, batch))}&lang=en"
+        
+        try:
+            resp = requests.get(url, headers=headers, timeout=5, verify=False)
             
-            completed += 1
-            if completed % 10 == 0:
-                progress_bar.progress(min(completed / total, 1.0))
-                status_text.text(f"Scanning... {len(market)} prices found (Checked {completed}/{total})")
-                
-    progress_bar.empty()
-    status_text.empty()
+            # CASE A: SUCCESS
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    for item in data:
+                        pid = int(item.get('id', 0))
+                        if pid != 0:
+                            market[pid] = {
+                                'p': int(item.get('pricePerOne', 0)),
+                                's': int(item.get('currentStock', 0))
+                            }
+                else:
+                    # Weird non-list response? Treat as failure
+                    raise ValueError("API returned non-list")
+
+            # CASE B: FAILURE (500/404) -> Fallback to Single Item Fetch
+            else:
+                # One of these items is bad. Try them one by one.
+                for single_id in batch:
+                    try:
+                        s_url = f"https://api.arsha.io/v2/{reg}/price?id={single_id}&lang=en"
+                        s_resp = requests.get(s_url, headers=headers, timeout=2, verify=False)
+                        if s_resp.status_code == 200:
+                            s_data = s_resp.json()
+                            if isinstance(s_data, list) and s_data:
+                                item = s_data[0]
+                                market[int(item['id'])] = {
+                                    'p': int(item['pricePerOne']),
+                                    's': int(item['currentStock'])
+                                }
+                    except: pass # Skip truly broken items
+                    time.sleep(0.05) # Tiny delay
+
+        except Exception as e:
+            print(f"Batch failed: {e}")
+        
+        # Update UI
+        bar.progress(min((i + batch_size) / len(safe_ids), 1.0))
+        status.caption(f"Scanning... Found prices for {len(market)} items")
+        time.sleep(0.1)
+        
+    bar.empty()
+    status.empty()
     return market
 
-# --- 4. MAIN APP LOGIC ---
+# --- 3. MAIN LOGIC ---
 db, logs = load_data_strict()
 
 with st.expander("📂 System Status", expanded=False):
     for l in logs:
         st.write(l)
 
-# --- ONE CLICK TEST BUTTON ---
-st.write("---")
+# DIAGNOSTIC PANEL
+st.divider()
 col_test, col_run = st.columns([1, 2])
 
 with col_test:
-    if st.button("🧪 Test Connection (Beer)", type="secondary"):
-        with st.spinner("Testing connection to Arsha..."):
-            # Beer ID = 9213
-            test_res = get_market_threaded([9213], region)
-            if 9213 in test_res:
-                st.success(f"✅ SUCCESS! Beer Price: {test_res[9213]['p']:,} silver")
-                st.json(test_res)
+    if st.button("🧪 Connection Test", type="secondary"):
+        st.write("Attempting to fetch **Beer (9213)**...")
+        try:
+            url = f"https://api.arsha.io/v2/{region}/price?id=9213&lang=en"
+            r = requests.get(url, timeout=5, verify=False, headers={'User-Agent': 'Mozilla/5.0'})
+            st.write(f"**Status:** {r.status_code}")
+            if r.status_code == 200:
+                st.success("✅ Success!")
+                st.json(r.json())
             else:
-                st.error("❌ Connection Failed. API might be down or Region is wrong.")
+                st.error("❌ Failed.")
+                st.write(f"Raw Response: {r.text}")
+        except Exception as e:
+            st.error(f"❌ Connection Error: {e}")
 
 with col_run:
-    if st.button("🚀 RUN FULL SCAN", type="primary"):
+    if st.button("🚀 START SAFE SCAN", type="primary"):
         if not db:
             st.error("No recipes.")
         else:
+            # Gather IDs
             all_ids = set()
             for r in db:
                 all_ids.add(r['product']['id'])
@@ -147,8 +179,8 @@ with col_run:
                     for i in g.get('item', []):
                         all_ids.add(i['id'])
             
-            st.info(f"Targeting {len(all_ids)} unique items. Using 'Tank Mode' (Threaded Single Fetch)...")
-            market = get_market_threaded(all_ids, region)
+            st.info(f"Scanning {len(all_ids)} items (Skipping {len(BLACKLIST_IDS)} known vendor items)...")
+            market = get_market_smart(list(all_ids), region)
             
             results = []
             for r in db:
@@ -165,13 +197,25 @@ with col_run:
                 for g in r.get('ingredients', []):
                     opts = g.get('item', [])
                     valid_prices = []
+                    
+                    # Check if this ingredient group uses a Vendor Item
+                    is_vendor_group = False
                     for o in opts:
-                        oid = o['id']
-                        if oid in market:
-                            if market[oid]['s'] >= min_stock:
-                                valid_prices.append(market[oid]['p'])
+                        if o['id'] in BLACKLIST_IDS:
+                            is_vendor_group = True
+                            # Assume negligible cost for vendor items or add manual price if needed
+                            # For now, we assume 0 or low cost, but mark it as 'possible'
+                            valid_prices.append(0) 
+                    
+                    if not is_vendor_group:
+                        for o in opts:
+                            oid = o['id']
+                            if oid in market:
+                                if market[oid]['s'] >= min_stock:
+                                    valid_prices.append(market[oid]['p'])
                     
                     if valid_prices:
+                        # Use cheapest ingredient
                         cost += (min(valid_prices) * g['amount'])
                     else:
                         possible = False
@@ -188,7 +232,7 @@ with col_run:
                         "Cost": int(cost),
                         "Price": int(sell_price),
                         "Stock": "✅" if possible else "❌",
-                        "Notes": f"Missing: {missing[0]}" if missing else ""
+                        "Missing": missing[0] if missing else ""
                     })
 
             if results:
@@ -200,4 +244,4 @@ with col_run:
                     "Price": st.column_config.NumberColumn(format="%d"),
                 })
             else:
-                st.error("No items found. Try the Test button to verify connectivity.")
+                st.error("No items found. Run the 'Connection Test' on the left to diagnose.")
