@@ -11,9 +11,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
+import shutil
 
-st.set_page_config(page_title="BDOLytics Recursive Scanner", layout="wide")
-st.title("🍳 BDOLytics Smart Scanner (System Path Fix)")
+st.set_page_config(page_title="BDOLytics Fast Scanner", layout="wide")
+st.title("🍳 BDOLytics Smart Scanner (Fast Mode)")
 
 # --- SETTINGS ---
 with st.sidebar:
@@ -27,7 +28,6 @@ with st.sidebar:
 def load_recipe_databases():
     name_map = {}
     recipe_db = {}
-    
     files = ["recipesCooking.json", "recipesAlchemy.json", "recipesProcessing.json"]
     VENDOR_IDS = {5600, 9059, 9001, 9002, 9005, 9015, 9016, 9017, 9018, 9066, 6656, 6655, 9003, 9006}
 
@@ -44,9 +44,7 @@ def load_recipe_databases():
                     if 'ingredients' in r:
                         ingredients = []
                         for group in r['ingredients']:
-                            valid_options = []
-                            for item in group['item']:
-                                valid_options.append(int(item['id']))
+                            valid_options = [int(item['id']) for item in group['item']]
                             if valid_options:
                                 ingredients.append(valid_options)
                         recipe_db[pid] = ingredients
@@ -54,7 +52,7 @@ def load_recipe_databases():
         
     return name_map, recipe_db, VENDOR_IDS
 
-# --- 2. SCRAPE BDOLYTICS (Hardcoded Paths) ---
+# --- 2. SCRAPE BDOLYTICS (OPTIMIZED) ---
 @st.cache_resource
 def get_bdolytics_top_items(reg, cat):
     url = f"https://bdolytics.com/en/{reg}/{cat}/market"
@@ -64,31 +62,39 @@ def get_bdolytics_top_items(reg, cat):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
     
-    # CRITICAL: Point to the system-installed Chromium
-    options.binary_location = "/usr/bin/chromium"
+    # CRITICAL: Do not wait for ads/images to load
+    options.page_load_strategy = 'eager'
     
+    # Path Detection (Works on both Linux Cloud and Windows Local)
+    chrome_bin = shutil.which("chromium") or shutil.which("chrome") or "/usr/bin/chromium"
+    driver_bin = shutil.which("chromedriver") or "/usr/bin/chromedriver"
+    
+    if chrome_bin: options.binary_location = chrome_bin
+
     data = []
     driver = None
     
     try:
-        # CRITICAL: Point to the system-installed Driver
-        service = Service("/usr/bin/chromedriver")
-        
+        service = Service(driver_bin) if driver_bin else Service()
         driver = webdriver.Chrome(service=service, options=options)
+        
         driver.get(url)
         
-        # Wait for table
+        # Increased timeout to 25s, but 'eager' mode should make this instant
         try:
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "tbody")))
+            WebDriverWait(driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "tbody")))
         except:
-            st.error("Timed out waiting for BDOLytics to load.")
+            st.error("Still timed out. BDOLytics might be blocking the IP or loading very slowly.")
             return []
             
-        time.sleep(3) # Extra buffer for JS render
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        # Small buffer for table population
+        time.sleep(2) 
         
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
         rows = soup.find_all('tr')
+        
         for row in rows[1:]:
             cols = row.find_all('td')
             if len(cols) < 4: continue
@@ -104,7 +110,7 @@ def get_bdolytics_top_items(reg, cat):
             if len(data) >= 50: break
             
     except Exception as e:
-        st.error(f"Selenium Error: {e}")
+        st.error(f"Browser Error: {e}")
         return []
     finally:
         if driver: driver.quit()
@@ -113,14 +119,17 @@ def get_bdolytics_top_items(reg, cat):
 
 # --- 3. RECURSIVE STOCK CHECKER ---
 def check_stock_recursive(target_id, market_data, recipe_db, vendor_ids, depth=0):
-    if depth > 3: return False
+    if depth > 5: return False
     
+    # 1. Vendor
     if target_id in vendor_ids: return True
     
+    # 2. Market
     stock = market_data.get(target_id, 0)
     if stock >= st.session_state.get('min_stock_val', 100):
         return True
         
+    # 3. Craftable?
     if target_id in recipe_db:
         ingredients = recipe_db[target_id]
         for slot_options in ingredients:
@@ -137,10 +146,10 @@ def check_stock_recursive(target_id, market_data, recipe_db, vendor_ids, depth=0
 
 # --- 4. PROCESSING ---
 def process_market_data(items_list, name_map, recipe_db, vendor_ids, reg):
-    # 1. Collect IDs
+    # Collect IDs
     ids_to_fetch = set()
     def collect_ids(pid, d):
-        if d > 3: return
+        if d > 5: return
         if pid in recipe_db:
             for group in recipe_db[pid]:
                 for iid in group:
@@ -152,17 +161,18 @@ def process_market_data(items_list, name_map, recipe_db, vendor_ids, reg):
         if item['Name'] in name_map:
             collect_ids(name_map[item['Name']], 0)
             
-    # 2. Fetch Market Data
+    # Fetch Market Data
     market_stock = {}
     id_list = list(ids_to_fetch)
-    batch_size = 50
     headers = {'User-Agent': 'Mozilla/5.0'}
     
+    # Progress UI
     bar = st.progress(0)
     status_text = st.empty()
     
-    for i in range(0, len(id_list), batch_size):
-        batch = id_list[i:i+batch_size]
+    # Batch Fetch
+    for i in range(0, len(id_list), 50):
+        batch = id_list[i:i+50]
         url = f"https://api.arsha.io/v2/{reg.lower()}/price?id={','.join(map(str, batch))}"
         try:
             r = requests.get(url, headers=headers, timeout=5)
@@ -171,14 +181,13 @@ def process_market_data(items_list, name_map, recipe_db, vendor_ids, reg):
                     market_stock[int(x.get('id', 0))] = int(x.get('currentStock', 0))
         except: pass
         
-        status_text.text(f"Market Check: {i}/{len(id_list)} items...")
-        bar.progress(min((i+batch_size)/len(id_list), 1.0))
+        bar.progress(min((i+50)/len(id_list), 1.0))
         time.sleep(0.1)
     
     bar.empty()
     status_text.empty()
     
-    # 3. Validate
+    # Validate
     final_results = []
     st.session_state['min_stock_val'] = min_stock
     
@@ -193,7 +202,6 @@ def process_market_data(items_list, name_map, recipe_db, vendor_ids, reg):
             for group in recipe_db[pid]: 
                 variation_ok = True
                 for slot_opts in group:
-                    if isinstance(slot_opts, int): slot_opts = [slot_opts]
                     slot_filled = False
                     for opt in slot_opts:
                         if check_stock_recursive(opt, market_stock, recipe_db, vendor_ids):
@@ -222,7 +230,7 @@ if st.button("🚀 Scrape & Smart-Check"):
     if not name_map:
         st.error("JSON files missing.")
     else:
-        with st.spinner("Step 1: Scraping BDOLytics..."):
+        with st.spinner("Step 1: Scraping BDOLytics (Fast Mode)..."):
             top_items = get_bdolytics_top_items(region, category)
         
         if top_items:
@@ -231,7 +239,7 @@ if st.button("🚀 Scrape & Smart-Check"):
             
             if valid_items:
                 df = pd.DataFrame(valid_items)
-                st.success(f"Found {len(valid_items)} profitable items you can craft RIGHT NOW!")
+                st.success(f"Found {len(valid_items)} profitable items available now!")
                 st.dataframe(
                     df, 
                     use_container_width=True,
@@ -240,4 +248,4 @@ if st.button("🚀 Scrape & Smart-Check"):
                     }
                 )
             else:
-                st.warning("No items found where all ingredients are available (even recursively).")
+                st.warning("No items found where all ingredients are available.")
