@@ -1,27 +1,25 @@
 import streamlit as st
-import requests
+import cloudscraper
 import pandas as pd
 import json
 import time
-import urllib3
 
-# Suppress SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+st.set_page_config(page_title="BDO Final Bypass", layout="wide")
+st.title("🛡️ BDO Global Scanner (Cloudflare Bypass)")
 
-st.set_page_config(page_title="BDO Multi-Protocol Scanner", layout="wide")
-st.title("🛡️ BDO Global Scanner (Multi-Protocol)")
+# --- CONFIG ---
+# Initializes the Cloudflare bypasser
+scraper = cloudscraper.create_scraper() 
 
 # --- SETTINGS ---
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3 = st.columns(3)
 with col1:
     mastery = st.number_input("Mastery", 2000, step=50)
 with col2:
-    region = st.selectbox("Region", ["na", "eu", "sea", "kr", "sa", "ru", "jp"])
+    # Arsha V2 is sensitive. We will try both cases if one fails.
+    region_input = st.selectbox("Region", ["NA", "EU", "SEA", "KR", "SA", "RU", "JP"])
 with col3:
     min_stock = st.number_input("Min Stock", 0, step=10)
-with col4:
-    # NEW: Allow user to switch API methods if one is broken
-    protocol = st.selectbox("API Protocol", ["v2 (Batch)", "v1 (Single)", "Hotlist (Test)"])
 
 tax = 0.845 
 
@@ -31,7 +29,6 @@ def load_data_strict():
     db = []
     log = []
     files = ["recipesCooking.json", "recipesAlchemy.json", "recipesProcessing.json"]
-    
     for f in files:
         try:
             with open(f, 'r') as file:
@@ -53,64 +50,49 @@ def load_data_strict():
             log.append(f"❌ {f}: Failed - {e}")
     return db, log
 
-# --- 2. MULTI-PROTOCOL API ---
-def get_market_data(ids, reg, proto):
+# --- 2. ROBUST API FETCH ---
+def get_market_bypass(ids, reg):
     market = {}
-    
-    # Filter known trash to prevent 500 errors
+    # Filter trash IDs that act as "poison pills" for the API
     BLACKLIST = {5600, 9059, 9001, 9002, 9005, 9017, 9066, 9016, 9015, 9018, 6656, 6655}
     safe_ids = list(set([int(i) for i in ids if int(i) not in BLACKLIST]))
     
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     bar = st.progress(0)
     status = st.empty()
     
-    # --- PROTOCOL: V2 (Batch) ---
-    if "v2" in proto:
-        batch_size = 20
-        for i in range(0, len(safe_ids), batch_size):
-            batch = safe_ids[i:i+batch_size]
-            if not batch: continue
-            
-            url = f"https://api.arsha.io/v2/{reg}/price?id={','.join(map(str, batch))}&lang=en"
+    # Batch size 20 is safe for V2
+    batch_size = 20
+    
+    for i in range(0, len(safe_ids), batch_size):
+        batch = safe_ids[i:i+batch_size]
+        if not batch: continue
+        
+        # Try lowercase region first (na), then uppercase (NA)
+        for r_code in [reg.lower(), reg.upper()]:
+            url = f"https://api.arsha.io/v2/{r_code}/price?id={','.join(map(str, batch))}&lang=en"
             try:
-                r = requests.get(url, headers=headers, verify=False, timeout=5)
-                if r.status_code == 200:
-                    data = r.json()
+                # USE SCRAPER INSTEAD OF REQUESTS
+                resp = scraper.get(url, timeout=10)
+                
+                if resp.status_code == 200:
+                    data = resp.json()
                     if isinstance(data, list):
-                        for x in data:
-                            pid = int(x.get('id', 0))
-                            if pid: market[pid] = {'p': int(x.get('pricePerOne', 0)), 's': int(x.get('currentStock', 0))}
-            except: pass
-            
-            bar.progress(min((i + batch_size) / len(safe_ids), 1.0))
-            status.text(f"V2 Scanning... Found {len(market)} items")
-            time.sleep(0.1)
-
-    # --- PROTOCOL: V1 (Single Fetch - Slower but Reliable) ---
-    elif "v1" in proto:
-        for i, pid in enumerate(safe_ids):
-            url = f"https://api.arsha.io/v1/{reg}/{pid}"
-            try:
-                r = requests.get(url, headers=headers, verify=False, timeout=2)
-                if r.status_code == 200:
-                    # V1 sometimes returns list, sometimes dict
-                    data = r.json()
-                    if isinstance(data, list) and data:
-                        data = data[0] # Take first item if list
-                    
-                    if isinstance(data, dict) and 'pricePerOne' in data:
-                         market[pid] = {
-                             'p': int(data.get('pricePerOne', 0)), 
-                             's': int(data.get('currentStock', 0))
-                         }
-            except: pass
-            
-            if i % 5 == 0:
-                bar.progress(min(i / len(safe_ids), 1.0))
-                status.text(f"V1 Scanning... Found {len(market)} items")
-            time.sleep(0.05) # Be gentle
-
+                        for item in data:
+                            pid = int(item.get('id', 0))
+                            if pid != 0:
+                                market[pid] = {
+                                    'p': int(item.get('pricePerOne', 0)),
+                                    's': int(item.get('currentStock', 0))
+                                }
+                        break # Success, stop trying region codes
+            except Exception:
+                pass
+        
+        # UI Updates
+        bar.progress(min((i + batch_size) / len(safe_ids), 1.0))
+        status.text(f"Bypassing... Found {len(market)} prices")
+        time.sleep(0.1) # Respect rate limits
+        
     bar.empty()
     status.empty()
     return market
@@ -118,59 +100,33 @@ def get_market_data(ids, reg, proto):
 # --- 3. MAIN LOGIC ---
 db, logs = load_data_strict()
 
-with st.expander("📂 System Status", expanded=False):
+with st.expander("System Status", expanded=False):
     for l in logs:
         st.write(l)
 
-# DIAGNOSTIC PANEL
-st.divider()
-st.subheader("🧪 Diagnostic Test")
-col_t1, col_t2, col_t3 = st.columns(3)
+# --- DIAGNOSTIC BUTTON ---
+if st.button("🧪 Force Test Connection (Cloudscraper)"):
+    st.info("Attempting to bypass Cloudflare block...")
+    try:
+        # Try fetching just Beer (9213)
+        url = f"https://api.arsha.io/v2/{region_input.lower()}/price?id=9213"
+        r = scraper.get(url, timeout=10)
+        
+        if r.status_code == 200:
+            st.success(f"✅ CONNECTION ESTABLISHED! Status: {r.status_code}")
+            st.json(r.json())
+        else:
+            st.error(f"❌ Blocked. Status: {r.status_code}")
+            st.code(r.text) # Show exactly what the server said
+    except Exception as e:
+        st.error(f"❌ Error: {e}")
 
-with col_t1:
-    if st.button("Test V2 (Batch)"):
-        try:
-            r = requests.get(f"https://api.arsha.io/v2/{region}/price?id=9213", headers={'User-Agent': 'Mozilla/5.0'}, verify=False, timeout=5)
-            if r.status_code == 200:
-                st.success(f"V2 Working! {r.json()[0]['pricePerOne']}")
-            else:
-                st.error(f"V2 Failed: {r.status_code}")
-        except Exception as e: st.error(str(e))
-
-with col_t2:
-    if st.button("Test V1 (Single)"):
-        try:
-            r = requests.get(f"https://api.arsha.io/v1/{region}/9213", headers={'User-Agent': 'Mozilla/5.0'}, verify=False, timeout=5)
-            if r.status_code == 200:
-                # V1 structure might vary
-                data = r.json()
-                price = data[0]['pricePerOne'] if isinstance(data, list) else data.get('pricePerOne', 'Err')
-                st.success(f"V1 Working! {price}")
-            else:
-                st.error(f"V1 Failed: {r.status_code}")
-        except Exception as e: st.error(str(e))
-
-with col_t3:
-    if st.button("Test Category (Food)"):
-        try:
-            # Fetches 'Consumables -> Food' list
-            url = f"https://api.arsha.io/v2/{region}/GetWorldMarketSubList?mainCategory=35&subCategory=1"
-            r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, verify=False, timeout=5)
-            if r.status_code == 200:
-                data = r.json()
-                st.success(f"Cat Working! Found {len(data)} items")
-            else:
-                st.error(f"Cat Failed: {r.status_code}")
-        except Exception as e: st.error(str(e))
-
-st.divider()
-
-# RUN BUTTON
+# --- SCAN BUTTON ---
 if st.button("🚀 RUN SCAN", type="primary"):
     if not db:
         st.error("No recipes.")
     else:
-        # Collect IDs
+        # Gather IDs
         all_ids = set()
         for r in db:
             all_ids.add(r['product']['id'])
@@ -178,9 +134,7 @@ if st.button("🚀 RUN SCAN", type="primary"):
                 for i in g.get('item', []):
                     all_ids.add(i['id'])
         
-        # API FETCH
-        st.info(f"Fetching data for {len(all_ids)} items using {protocol}...")
-        market = get_market_data(list(all_ids), region, protocol)
+        market = get_market_bypass(list(all_ids), region_input)
         
         results = []
         for r in db:
@@ -197,16 +151,16 @@ if st.button("🚀 RUN SCAN", type="primary"):
             for g in r.get('ingredients', []):
                 opts = g.get('item', [])
                 valid_prices = []
-                for o in opts:
-                    # Check blacklist for vendors
-                    if o['id'] in [5600, 9059, 9001, 9002, 9005]:
-                        valid_prices.append(0)
-                        continue
-
-                    oid = o['id']
-                    if oid in market:
-                        if market[oid]['s'] >= min_stock:
-                            valid_prices.append(market[oid]['p'])
+                
+                # Check blacklist
+                if opts and opts[0]['id'] in [5600, 9059, 9001, 9002, 9005]:
+                    valid_prices.append(0)
+                else:
+                    for o in opts:
+                        oid = o['id']
+                        if oid in market:
+                            if market[oid]['s'] >= min_stock:
+                                valid_prices.append(market[oid]['p'])
                 
                 if valid_prices:
                     cost += (min(valid_prices) * g['amount'])
@@ -225,7 +179,7 @@ if st.button("🚀 RUN SCAN", type="primary"):
                     "Cost": int(cost),
                     "Price": int(sell_price),
                     "Stock": "✅" if possible else "❌",
-                    "Missing": ", ".join(missing[:1])
+                    "Missing": missing[0] if missing else ""
                 })
 
         if results:
@@ -233,4 +187,4 @@ if st.button("🚀 RUN SCAN", type="primary"):
             st.success(f"Success! {len(results)} items analyzed.")
             st.dataframe(df, use_container_width=True)
         else:
-            st.error("No valid items found. Try switching the 'API Protocol' dropdown at the top.")
+            st.error("No items found. If 'Force Test' failed above, the Streamlit server IP is completely banned.")
