@@ -4,165 +4,166 @@ import pandas as pd
 import json
 import time
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="BDO Deep Scanner", layout="wide")
-st.title("🛡️ BDO Buy-to-Sell: Deep Diagnostic Mode")
+st.set_page_config(page_title="BDO Strict Fix", layout="wide")
+st.title("🛡️ BDO Global Scanner (Type-Safe Fix)")
 
-# --- DEBUG: SHOW LOADED STRUCTURE ---
-st.write("### 🔍 1. File Structure Check")
+# --- SETTINGS ---
+col1, col2, col3 = st.columns(3)
+with col1:
+    mastery = st.number_input("Mastery", 2000, step=50)
+with col2:
+    region = st.selectbox("Region", ["na", "eu", "sea", "kr"])
+with col3:
+    # Set default to 0 so we see EVERYTHING, even out-of-stock items
+    min_stock = st.number_input("Min Stock", 0, step=10)
 
+tax = 0.845 # VP assumed
+
+# --- 1. ROBUST DATA LOADER ---
 @st.cache_data
 def load_data_strict():
-    """Loads data and strictly enforces structure."""
-    all_recipes = []
-    # Filenames must match GitHub exactly
-    files = ["recipesProcessing.json", "recipesCooking.json", "recipesAlchemy.json"]
+    db = []
+    log = []
+    files = ["recipesCooking.json", "recipesAlchemy.json", "recipesProcessing.json"]
     
-    status_msg = []
-    
-    for f_name in files:
+    for f in files:
         try:
-            with open(f_name, 'r') as f:
-                raw = json.load(f)
-                # LifeBDO format check: does "recipes" key exist?
-                if "recipes" in raw:
-                    count = 0
-                    for r in raw["recipes"]:
-                        # Tag category
-                        r["_cat"] = "Processing" if "Processing" in f_name else "Cooking/Alchemy"
-                        all_recipes.append(r)
-                        count += 1
-                    status_msg.append(f"✅ **{f_name}**: Successfully loaded {count} recipes.")
-                else:
-                    status_msg.append(f"❌ **{f_name}**: Failed. JSON missing 'recipes' key.")
-        except FileNotFoundError:
-            status_msg.append(f"❌ **{f_name}**: File not found in repo.")
+            with open(f, 'r') as file:
+                raw = json.load(file)
+                # LifeBDO format: root -> "recipes" list
+                recipes = raw.get('recipes', [])
+                
+                for r in recipes:
+                    # FORCE ID CONVERSION HERE
+                    try:
+                        # Handle Product ID (Fixes "11527" string vs 4680 int issue)
+                        r['product']['id'] = int(r['product']['id'])
+                        
+                        # Handle Ingredient IDs
+                        if 'ingredients' in r:
+                            for group in r['ingredients']:
+                                if 'item' in group:
+                                    for item in group['item']:
+                                        item['id'] = int(item['id'])
+                                        
+                        r['_src'] = f
+                        db.append(r)
+                    except ValueError:
+                        continue # Skip malformed entries
+                        
+                log.append(f"✅ {f}: Loaded {len(recipes)} recipes")
         except Exception as e:
-            status_msg.append(f"❌ **{f_name}**: Error - {str(e)}")
+            log.append(f"❌ {f}: Failed - {e}")
             
-    return all_recipes, status_msg
+    return db, log
 
-db, logs = load_data_strict()
-
-# Print status to screen
-for l in logs:
-    st.markdown(l)
-
-# Show the first recipe to prove data is real
-if db:
-    with st.expander("Click to see raw data of first recipe (Debugging)"):
-        st.json(db[0])
-
-# --- MARKET API ---
-def fetch_market_strict(ids, region_code):
-    price_map = {}
-    # Deduplicate and clean IDs
-    clean_ids = list(set([str(i) for i in ids if str(i).isdigit()]))
+# --- 2. MARKET API (Integer Forced) ---
+def get_market(ids, reg):
+    market = {}
+    # Dedup and ensure strings for URL
+    id_list = list(set([str(i) for i in ids]))
     
-    st.write(f"### 📡 2. Querying API for {len(clean_ids)} items...")
+    # Progress Bar
     bar = st.progress(0)
+    status = st.empty()
     
     # Batch size 100
-    for i in range(0, len(clean_ids), 100):
-        batch = clean_ids[i : i+100]
-        url = f"https://api.arsha.io/v1/{region_code}/price?id={','.join(batch)}"
-        
+    for i in range(0, len(id_list), 100):
+        batch = id_list[i:i+100]
+        url = f"https://api.arsha.io/v1/{reg}/price?id={','.join(batch)}"
         try:
             resp = requests.get(url, timeout=5)
             if resp.status_code == 200:
-                for item in resp.json():
-                    # STORE AS INTEGER TO MATCH JSON
-                    try:
-                        pid = int(item['id'])
-                        price_map[pid] = {
-                            'price': int(item['price']),
-                            'stock': int(item['stock'])
-                        }
-                    except: pass
+                for x in resp.json():
+                    # FORCE INTEGER KEY matches Loader
+                    market[int(x['id'])] = {
+                        'p': int(x['price']),
+                        's': int(x['stock'])
+                    }
         except: pass
         
-        bar.progress(min((i+100)/len(clean_ids), 1.0))
+        bar.progress(min((i+100)/len(id_list), 1.0))
+        status.text(f"Fetching prices... {len(market)} items found")
         
     bar.empty()
-    return price_map
+    status.empty()
+    return market
 
-# --- MAIN SCANNER ---
-if st.button("🚀 RUN DEEP SCAN", type="primary"):
+# --- 3. MAIN LOGIC ---
+db, logs = load_data_strict()
+
+# Status Check
+with st.expander("System Status", expanded=True):
+    for l in logs:
+        st.write(l)
+
+if st.button("🚀 RUN SCAN", type="primary"):
     if not db:
-        st.error("No data loaded. Cannot scan.")
+        st.error("No recipes loaded.")
     else:
-        # 1. Gather IDs
-        scan_ids = set()
+        # Collect IDs
+        all_ids = set()
         for r in db:
-            scan_ids.add(r['product']['id']) # Product ID
-            for group in r.get('ingredients', []):
-                for item in group.get('item', []):
-                    scan_ids.add(item['id']) # Ingredient IDs
+            all_ids.add(r['product']['id'])
+            for g in r.get('ingredients', []):
+                for i in g.get('item', []):
+                    all_ids.add(i['id'])
         
-        # 2. Get Prices
-        market = fetch_market_strict(scan_ids, "na") # Defaulting to NA for test
+        # Get Prices
+        market = get_market(all_ids, region)
         
-        # 3. Calculate
         results = []
         
         for r in db:
-            pid = int(r['product']['id'])
+            pid = r['product']['id']
+            pname = r['product']['name']
             
-            # If product has no price, skip
-            if pid not in market: continue
+            # Allow items even if price is missing (set to 0 for visibility)
+            sell_price = market.get(pid, {}).get('p', 0)
             
-            sell_price = market[pid]['price']
-            stock_count = market[pid]['stock']
+            # Calculate Cost
+            cost = 0
+            possible = True
             
-            total_cost = 0
-            is_valid = True
-            
-            # Loop ingredients
-            for group in r.get('ingredients', []):
-                # Find cheapest option in group (e.g. Any Timber)
-                options = group.get('item', [])
-                cheapest_price = 999999999
-                found_opt = False
+            for g in r.get('ingredients', []):
+                # Find cheapest valid ingredient in group
+                opts = g.get('item', [])
+                valid_prices = []
                 
-                for opt in options:
-                    oid = int(opt['id'])
+                for o in opts:
+                    oid = o['id']
                     if oid in market:
-                        # We accept 0 stock items now, but warn about them
-                        p = market[oid]['price']
-                        if p < cheapest_price:
-                            cheapest_price = p
-                            found_opt = True
+                        if market[oid]['s'] >= min_stock:
+                            valid_prices.append(market[oid]['p'])
                 
-                if found_opt:
-                    total_cost += (cheapest_price * group['amount'])
+                if valid_prices:
+                    cost += (min(valid_prices) * g['amount'])
                 else:
-                    # If absolutely no price found for any option, fail
-                    is_valid = False
-                    break
+                    possible = False
+                    # Don't break, just mark as impossible but keep checking other mats
             
-            if is_valid:
-                # 2025 Yields
-                mult = 2.5 if r['_cat'] == "Processing" else 1.25 # Lower conservative yield for cook/alch
-                
-                # Simple Profit Calc
-                profit = (sell_price * mult * 0.845) - total_cost
-                
+            # Calculate Yield
+            # Processing is flat ~2.5. Cooking/Alch is Mastery
+            y_mult = 2.5 if "Processing" in r['_src'] else 1.0 + (mastery/4000)*0.3 + 1.35
+            
+            revenue = sell_price * y_mult * tax
+            profit = revenue - cost
+            
+            # Add to list if we have a sell price (even if profit is neg)
+            if sell_price > 0:
                 results.append({
-                    "Item": r['product']['name'],
-                    "Type": r['_cat'],
-                    "Profit": profit,
-                    "Cost": total_cost,
-                    "Price": sell_price,
-                    "Product Stock": stock_count
+                    "Item": pname,
+                    "Profit/Hr": profit * 900,
+                    "Cost": cost,
+                    "Stock": "✅" if possible else "❌ Low Mats",
+                    "Source": r['_src'].replace("recipes", "").replace(".json", "")
                 })
-                
-        # 4. Show Table
+
         if results:
-            st.success(f"Scan complete! Found {len(results)} items.")
-            df = pd.DataFrame(results)
-            # Sort by Profit
-            df = df.sort_values(by="Profit", ascending=False)
+            df = pd.DataFrame(results).sort_values("Profit/Hr", ascending=False)
+            st.success(f"Generated data for {len(results)} items.")
             st.dataframe(df, use_container_width=True)
         else:
-            st.error("Still 0 items. This implies the Market API returned NO matching IDs for your recipes.")
-            st.write("Debug Sample (Market Data):", list(market.keys())[:10])
+            st.error("Still 0 items. Checking debug dump:")
+            st.write("First 5 Market Keys:", list(market.keys())[:5])
+            st.write("First 5 Recipe IDs:", [r['product']['id'] for r in db[:5]])
