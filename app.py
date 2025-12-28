@@ -1,68 +1,84 @@
 import streamlit as st
 import requests
 import pandas as pd
+import json
 
-st.set_page_config(page_title="BDO Profit Scanner", layout="wide")
-st.title("⚖️ BDO Buy-to-Sell: Live Profit Ranking (2025)")
+st.set_page_config(page_title="BDO Master Scanner", layout="wide")
+st.title("🛡️ BDO Buy-to-Sell: Full Database Scanner")
 
-# Configuration Sidebar
-st.sidebar.header("Settings")
-mastery = st.sidebar.number_input("Lifeskill Mastery", value=2000, step=50)
-region = st.sidebar.selectbox("Region", ["na", "eu", "sea", "kr"])
-tax_rate = st.sidebar.radio("Value Pack?", [0.845, 0.65], format_func=lambda x: "Yes (15.5%)" if x == 0.845 else "No (35%)")
+# --- SETTINGS ---
+with st.sidebar:
+    st.header("Parameters")
+    mastery = st.number_input("Lifeskill Mastery", value=2000)
+    region = st.selectbox("Region", ["na", "eu", "sea", "kr"])
+    tax = st.radio("Tax Rate", [0.845, 0.65], format_func=lambda x: "VP (15.5%)" if x == 0.845 else "No VP (35%)")
+    min_stock = st.slider("Min Component Stock", 1, 1000, 50)
+    # This dropdown lets you choose between the files you uploaded
+    db_choice = st.selectbox("Select Database", ["recipesCooking.json", "recipesAlchemy.json", "recipesProcessing.json"])
 
-# EXTENDED RECIPE DATABASE
-# Format: [ProductID, Category, {ComponentID: Quantity}]
-RECIPES = {
-    "Harmony Draught": [9691, "Alchemy", {9688: 1, 9689: 1, 9690: 1, 9635: 1}],
-    "Berserk Draught": [9636, "Alchemy", {9452: 1, 9460: 1, 9454: 1, 9635: 1}],
-    "Giant's Draught": [9638, "Alchemy", {9407: 1, 9403: 1, 9409: 1, 9635: 1}],
-    "Frenzy Elixir": [9452, "Alchemy", {525: 1, 5421: 4, 9461: 3, 9414: 5}],
-    "Spirit Elixir": [9460, "Alchemy", {528: 1, 5424: 4, 4601: 3, 9414: 5}],
-    "Pure Iron Crystal": [4057, "Processing", {4052: 3, 4433: 1}],
-    "Pure Copper Crystal": [4058, "Processing", {4053: 3, 4434: 1}],
-    "Pure Tin Crystal": [4060, "Processing", {4055: 3, 4436: 1}],
-    "Pure Zinc Crystal": [4062, "Processing", {4056: 3, 4437: 1}],
-    "O'dyllita Meal": [9276, "Cooking", {9273: 1, 9274: 1, 9275: 1, 9403: 2}],
-    "Kamasylvia Meal": [9213, "Cooking", {9209: 1, 9210: 1, 9211: 1, 9212: 1, 9414: 2}],
-    "Balenos Meal": [9203, "Cooking", {9201: 1, 9202: 1, 9402: 2, 9401: 2, 9403: 1}],
-    "Ship Repair Material": [5957, "Processing", {4052: 2, 4601: 2}]
-}
-
-def get_market_data(ids):
-    id_list = ",".join(map(str, ids))
-    url = f"https://api.arsha.io/v1/{region}/price?id={id_list}"
+# --- DATA LOADING ---
+@st.cache_data
+def load_db(file):
     try:
-        data = requests.get(url).json()
-        return {item['id']: (item['price'], item['stock']) for item in data}
+        with open(file, 'r') as f:
+            return json.load(f)
+    except: return []
+
+def get_market(ids):
+    # API handles joined IDs for efficiency
+    url = f"https://api.arsha.io/v1/{region}/price?id={','.join(map(str, ids))}"
+    try:
+        resp = requests.get(url).json()
+        return {item['id']: (item['price'], item['stock']) for item in resp}
     except: return {}
 
-if st.button("🔍 Scan for In-Stock Profits"):
-    all_ids = set()
-    for d in RECIPES.values():
-        all_ids.add(d[0])
-        all_ids.update(d[2].keys())
-    
-    market = get_market_data(all_ids)
-    results = []
+# --- SCANNER EXECUTION ---
+db = load_db(db_choice)
 
-    for name, data in RECIPES.items():
-        p_id, cat, mats = data
-        if p_id not in market: continue
+if st.button(f"🚀 Run Scan on {db_choice}"):
+    if not db:
+        st.error(f"File {db_choice} not found. Please ensure the file name matches exactly in GitHub.")
+    else:
+        # Collect all item IDs for one single API call to prevent rate limiting
+        all_ids = set()
+        for r in db:
+            all_ids.add(r['id'])
+            for i in r.get('ingredients', []): 
+                all_ids.add(i['id'])
         
-        sell_p, _ = market[p_id]
-        cost, in_stock = 0, True
-        
-        for m_id, qty in mats.items():
-            if m_id not in market or market[m_id][1] < 200:
-                in_stock = False
-                break
-            cost += (market[m_id][0] * qty)
-        
-        if in_stock:
-            y_mult = 2.5 if cat == "Processing" else 1.0 + (mastery/4000)*0.3 + 1.35
-            profit = ((sell_p * y_mult) * tax_rate) - cost
-            results.append({"Item": name, "Category": cat, "Silver/Hr": profit * 900})
+        market = get_market(list(all_ids))
+        results = []
 
-    df = pd.DataFrame(results).sort_values(by="Silver/Hr", ascending=False)
-    st.dataframe(df.style.format({"Silver/Hr": "{:,.0f}"}), use_container_width=True)
+        for r in db:
+            p_id = r['id']
+            if p_id not in market: continue
+            
+            sell_p, _ = market[p_id]
+            cost, in_stock = 0, True
+            
+            # Check every ingredient for availability and price
+            for i in r.get('ingredients', []):
+                m_id = i['id']
+                if m_id not in market or market[m_id][1] < min_stock:
+                    in_stock = False
+                    break
+                cost += (market[m_id][0] * i['quantity'])
+            
+            if in_stock:
+                # Logic: Processing uses a flat 2.5x yield; Cooking/Alchemy use Mastery formula
+                if "Processing" in db_choice:
+                    y_mult = 2.5 
+                else:
+                    y_mult = 1.0 + (mastery/4000)*0.3 + 1.35
+                
+                profit_per_craft = ((sell_p * y_mult) * tax) - cost
+                # Assuming a standard speed of 900 crafts per hour
+                results.append({"Item": r['name'], "Silver/Hr": profit_per_craft * 900})
+
+        if results:
+            # Sort with most profitable at the top
+            df = pd.DataFrame(results).sort_values(by="Silver/Hr", ascending=False)
+            st.success(f"Scan complete! Found {len(results)} items in stock.")
+            st.dataframe(df.style.format({"Silver/Hr": "{:,.0f}"}), use_container_width=True)
+        else:
+            st.warning("No items found with current stock levels. Try lowering 'Min Component Stock' in the sidebar.")
