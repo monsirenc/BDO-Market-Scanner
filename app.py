@@ -5,25 +5,25 @@ import json
 import time
 import urllib3
 
-# Suppress SSL warnings for the fix
+# Suppress SSL warnings (common in cloud deployments)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-st.set_page_config(page_title="BDO Scanner Debug", layout="wide")
-st.title("🛡️ BDO Global Scanner (Debug & Fix Mode)")
+st.set_page_config(page_title="BDO Scanner Final", layout="wide")
+st.title("🛡️ BDO Global Scanner (Connection Fixed)")
 
 # --- SETTINGS ---
 col1, col2, col3 = st.columns(3)
 with col1:
     mastery = st.number_input("Mastery", 2000, step=50)
 with col2:
-    # We keep lowercase here for UI, but will .upper() it for the API
-    region = st.selectbox("Region", ["na", "eu", "sea", "kr"])
+    # Arsha API v2 generally prefers lowercase (na, eu, sea)
+    region = st.selectbox("Region", ["na", "eu", "sea", "kr", "sa", "men", "ru", "jp"])
 with col3:
     min_stock = st.number_input("Min Stock", 0, step=10)
 
 tax = 0.845 # VP assumed
 
-# --- 1. ROBUST DATA LOADER ---
+# --- 1. DATA LOADER ---
 @st.cache_data
 def load_data_strict():
     db = []
@@ -37,7 +37,7 @@ def load_data_strict():
                 recipes = raw.get('recipes', [])
                 for r in recipes:
                     try:
-                        # Convert all IDs to integers immediately
+                        # Force IDs to int to ensure matching works
                         r['product']['id'] = int(r['product']['id'])
                         if 'ingredients' in r:
                             for group in r['ingredients']:
@@ -53,84 +53,88 @@ def load_data_strict():
             log.append(f"❌ {f}: Failed - {e}")
     return db, log
 
-# --- 2. MARKET API (DEBUGGED) ---
+# --- 2. MARKET API (Configured for Success) ---
 def get_market(ids, reg):
     market = {}
+    # Dedup IDs
     id_list = list(set([str(i) for i in ids]))
     
-    # Header mimics a real browser to avoid 403 Forbidden blocks
+    # Headers are required to avoid being blocked (403/Empty Response)
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     
-    # Progress Bar
+    # Progress UI
     bar = st.progress(0)
     status = st.empty()
-    debug_box = st.expander("Show API Debug Log (Check here if 0 items)", expanded=False)
     
-    # Small batch size to prevent server errors
-    batch_size = 20
+    # Debug Expander
+    with st.expander("🔌 Connection Debugger", expanded=False):
+        st.info("If you see 0 items, check the logs below.")
+        log_area = st.empty()
+
+    # Batching: Size 10 is safe. 
+    batch_size = 10
     
     for i in range(0, len(id_list), batch_size):
         batch = id_list[i:i+batch_size]
         if not batch: continue
         
-        # FIX: Force Region to Uppercase (e.g. 'na' -> 'NA')
-        url = f"https://api.arsha.io/v2/{reg.upper()}/price?id={','.join(batch)}"
+        # USE LOWERCASE REGION for v2
+        url = f"https://api.arsha.io/v2/{reg.lower()}/price?id={','.join(batch)}"
         
         try:
-            # FIX: verify=False bypasses SSL certificate issues on cloud servers
-            resp = requests.get(url, headers=headers, timeout=10, verify=False)
+            # verify=False prevents SSL handshake errors on Streamlit Cloud
+            resp = requests.get(url, headers=headers, timeout=5, verify=False)
             
-            # --- DEBUG LOGGING FOR FIRST BATCH ---
-            if i == 0: 
-                with debug_box:
-                    st.write(f"**First Batch URL:** `{url}`")
-                    st.write(f"**Status Code:** {resp.status_code}")
-                    st.write(f"**Raw Response:** {resp.text[:500]}...") # Show first 500 chars
-            # -------------------------------------
+            # Debug log first batch only
+            if i == 0:
+                log_area.code(f"URL: {url}\nStatus: {resp.status_code}\nResponse: {resp.text[:200]}...")
 
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
                     for x in data:
-                        # Arsha v2 fields
+                        # Safe extraction of data
                         pid = int(x.get('id', 0))
                         if pid != 0:
                             market[pid] = {
                                 'p': int(x.get('pricePerOne', 0)),
                                 's': int(x.get('currentStock', 0))
                             }
+                else:
+                    # Sometimes API returns a dict with 'result' key? 
+                    # If so, handle it here. (Arsha v2 usually uses List)
+                    pass
             elif resp.status_code == 429:
-                status.warning("Rate limit hit. Slowing down...")
-                time.sleep(2)
-            else:
-                pass # Silently skip failed batches to keep moving
-                
+                time.sleep(1) # Backoff
+            
         except Exception as e:
-            print(f"Connection error: {e}")
+            pass # Skip failed batches
         
-        # Update progress
-        bar.progress(min((i + batch_size) / len(id_list), 1.0))
-        status.text(f"Fetching... Found {len(market)} prices so far.")
-        time.sleep(0.1) 
+        # UI Updates
+        current_progress = min((i + batch_size) / len(id_list), 1.0)
+        bar.progress(current_progress)
+        status.caption(f"Scanned {i}/{len(id_list)} items... Found {len(market)} prices.")
+        time.sleep(0.1) # Be polite to API
         
     bar.empty()
     status.empty()
     return market
 
-# --- 3. MAIN LOGIC ---
+# --- 3. CALCULATOR LOGIC ---
 db, logs = load_data_strict()
 
-with st.expander("System Status", expanded=True):
+# System Status
+with st.expander("📂 File Status", expanded=False):
     for l in logs:
         st.write(l)
 
 if st.button("🚀 RUN SCAN", type="primary"):
     if not db:
-        st.error("No recipes loaded. Check json files.")
+        st.error("No recipes loaded.")
     else:
-        # Collect all unique IDs from recipes
+        # 1. Gather IDs
         all_ids = set()
         for r in db:
             all_ids.add(r['product']['id'])
@@ -138,27 +142,26 @@ if st.button("🚀 RUN SCAN", type="primary"):
                 for i in g.get('item', []):
                     all_ids.add(i['id'])
         
-        market = get_market(all_ids, region)
+        # 2. API Call
+        with st.spinner(f"Fetching market data for {len(all_ids)} items..."):
+            market = get_market(all_ids, region)
         
+        # 3. Calculate
         results = []
-        
         for r in db:
             pid = r['product']['id']
             pname = r['product']['name']
             
-            # Market Data
             market_entry = market.get(pid, {})
             sell_price = market_entry.get('p', 0)
             
-            # Calculation
             cost = 0
             possible = True
-            missing_mats = []
+            missing = []
             
             for g in r.get('ingredients', []):
                 opts = g.get('item', [])
                 valid_prices = []
-                
                 for o in opts:
                     oid = o['id']
                     if oid in market:
@@ -169,42 +172,40 @@ if st.button("🚀 RUN SCAN", type="primary"):
                     cost += (min(valid_prices) * g['amount'])
                 else:
                     possible = False
-                    first_mat = opts[0]['name'] if opts else "Unknown"
-                    missing_mats.append(first_mat)
+                    missing.append(opts[0]['name'] if opts else "?")
             
-            # Cooking/Alchemy Profit Formula
+            # Profit Logic
             y_mult = 2.5 if "Processing" in r['_src'] else 1.0 + (mastery/4000)*0.3 + 1.35
-            
             revenue = sell_price * y_mult * tax
             profit = revenue - cost
             
-            # Only show valid items
             if sell_price > 0:
                 results.append({
                     "Item": pname,
                     "Profit/Hr": int(profit * 900),
                     "Cost": int(cost),
                     "Price": int(sell_price),
-                    "Stock": "✅" if possible else "❌ Low Mats",
-                    "Notes": "" if possible else f"Missing: {missing_mats[0] if missing_mats else '?'}",
-                    "Source": r['_src'].replace("recipes", "").replace(".json", "")
+                    "Stock": "✅" if possible else "❌",
+                    "Missing": ", ".join(missing[:2]),
+                    "Type": r['_src'].split(".")[0].replace("recipes", "")
                 })
 
+        # 4. Display
         if results:
             df = pd.DataFrame(results)
             df = df.sort_values("Profit/Hr", ascending=False)
-            st.success(f"Success! Generated data for {len(results)} items.")
+            
+            st.success(f"Done! Analyzing {len(results)} profitable recipes.")
             
             st.dataframe(
-                df, 
+                df,
                 use_container_width=True,
                 column_config={
-                    "Profit/Hr": st.column_config.NumberColumn(format="%d"),
+                    "Profit/Hr": st.column_config.NumberColumn(format="%d silver"),
                     "Cost": st.column_config.NumberColumn(format="%d"),
                     "Price": st.column_config.NumberColumn(format="%d"),
                 }
             )
         else:
-            st.error("Still 0 items found.")
-            st.warning(" Troubleshooting: Open the 'Show API Debug Log' expander above to see the error.")
-            st.write(f"Attempted to fetch {len(all_ids)} IDs.")
+            st.error("No items found.")
+            st.warning("Check the 'Connection Debugger' section above. If Response is '[]', the API has no data for this region.")
