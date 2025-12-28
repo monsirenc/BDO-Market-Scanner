@@ -4,26 +4,27 @@ import pandas as pd
 import json
 import time
 import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Suppress SSL warnings (common in cloud deployments)
+# Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-st.set_page_config(page_title="BDO Scanner Final", layout="wide")
-st.title("🛡️ BDO Global Scanner (Connection Fixed)")
+st.set_page_config(page_title="BDO Tank Mode", layout="wide")
+st.title("🛡️ BDO Global Scanner (Tank Mode)")
 
 # --- SETTINGS ---
 col1, col2, col3 = st.columns(3)
 with col1:
     mastery = st.number_input("Mastery", 2000, step=50)
 with col2:
-    # Arsha API v2 generally prefers lowercase (na, eu, sea)
+    # Arsha V2 usually wants lowercase 'na', 'eu', etc.
     region = st.selectbox("Region", ["na", "eu", "sea", "kr", "sa", "men", "ru", "jp"])
 with col3:
     min_stock = st.number_input("Min Stock", 0, step=10)
 
-tax = 0.845 # VP assumed
+tax = 0.845 
 
-# --- 1. DATA LOADER ---
+# --- 1. DATA LOADER (UNCHANGED) ---
 @st.cache_data
 def load_data_strict():
     db = []
@@ -37,7 +38,6 @@ def load_data_strict():
                 recipes = raw.get('recipes', [])
                 for r in recipes:
                     try:
-                        # Force IDs to int to ensure matching works
                         r['product']['id'] = int(r['product']['id'])
                         if 'ingredients' in r:
                             for group in r['ingredients']:
@@ -46,166 +46,158 @@ def load_data_strict():
                                         item['id'] = int(item['id'])
                         r['_src'] = f
                         db.append(r)
-                    except ValueError:
-                        continue 
+                    except ValueError: continue 
                 log.append(f"✅ {f}: Loaded {len(recipes)} recipes")
         except Exception as e:
             log.append(f"❌ {f}: Failed - {e}")
     return db, log
 
-# --- 2. MARKET API (Configured for Success) ---
-def get_market(ids, reg):
+# --- 2. SINGLE ITEM FETCH (THE FIX) ---
+def fetch_single_item(session, pid, reg):
+    """
+    Fetches a single item. If it fails (500), it returns None 
+    so it doesn't crash the whole app.
+    """
+    url = f"https://api.arsha.io/v2/{reg}/price?id={pid}&lang=en"
+    try:
+        # verify=False is crucial for Streamlit Cloud
+        resp = session.get(url, timeout=5, verify=False)
+        if resp.status_code == 200:
+            data = resp.json()
+            # Arsha returns a LIST even for single items
+            if isinstance(data, list) and len(data) > 0:
+                item = data[0]
+                return {
+                    'id': int(item.get('id', 0)),
+                    'p': int(item.get('pricePerOne', 0)),
+                    's': int(item.get('currentStock', 0))
+                }
+    except:
+        pass
+    return None
+
+# --- 3. MARKET MANAGER (THREADED) ---
+def get_market_threaded(ids, reg):
     market = {}
-    # Dedup IDs
-    id_list = list(set([str(i) for i in ids]))
+    id_list = list(set([int(i) for i in ids]))
     
-    # Headers are required to avoid being blocked (403/Empty Response)
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+    # Session for connection pooling (faster)
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
     
     # Progress UI
-    bar = st.progress(0)
-    status = st.empty()
+    progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    # Debug Expander
-    with st.expander("🔌 Connection Debugger", expanded=False):
-        st.info("If you see 0 items, check the logs below.")
-        log_area = st.empty()
-
-    # Batching: Size 10 is safe. 
-    batch_size = 10
+    # Use 10 threads to fetch fast but safely
+    total = len(id_list)
+    completed = 0
     
-    for i in range(0, len(id_list), batch_size):
-        batch = id_list[i:i+batch_size]
-        if not batch: continue
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # Submit all tasks
+        futures = {executor.submit(fetch_single_item, session, pid, reg): pid for pid in id_list}
         
-        # USE LOWERCASE REGION for v2
-        url = f"https://api.arsha.io/v2/{reg.lower()}/price?id={','.join(batch)}"
-        
-        try:
-            # verify=False prevents SSL handshake errors on Streamlit Cloud
-            resp = requests.get(url, headers=headers, timeout=5, verify=False)
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                market[result['id']] = {'p': result['p'], 's': result['s']}
             
-            # Debug log first batch only
-            if i == 0:
-                log_area.code(f"URL: {url}\nStatus: {resp.status_code}\nResponse: {resp.text[:200]}...")
-
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list):
-                    for x in data:
-                        # Safe extraction of data
-                        pid = int(x.get('id', 0))
-                        if pid != 0:
-                            market[pid] = {
-                                'p': int(x.get('pricePerOne', 0)),
-                                's': int(x.get('currentStock', 0))
-                            }
-                else:
-                    # Sometimes API returns a dict with 'result' key? 
-                    # If so, handle it here. (Arsha v2 usually uses List)
-                    pass
-            elif resp.status_code == 429:
-                time.sleep(1) # Backoff
-            
-        except Exception as e:
-            pass # Skip failed batches
-        
-        # UI Updates
-        current_progress = min((i + batch_size) / len(id_list), 1.0)
-        bar.progress(current_progress)
-        status.caption(f"Scanned {i}/{len(id_list)} items... Found {len(market)} prices.")
-        time.sleep(0.1) # Be polite to API
-        
-    bar.empty()
-    status.empty()
+            completed += 1
+            if completed % 10 == 0:
+                progress_bar.progress(min(completed / total, 1.0))
+                status_text.text(f"Scanning... {len(market)} prices found (Checked {completed}/{total})")
+                
+    progress_bar.empty()
+    status_text.empty()
     return market
 
-# --- 3. CALCULATOR LOGIC ---
+# --- 4. MAIN APP LOGIC ---
 db, logs = load_data_strict()
 
-# System Status
-with st.expander("📂 File Status", expanded=False):
+with st.expander("📂 System Status", expanded=False):
     for l in logs:
         st.write(l)
 
-if st.button("🚀 RUN SCAN", type="primary"):
-    if not db:
-        st.error("No recipes loaded.")
-    else:
-        # 1. Gather IDs
-        all_ids = set()
-        for r in db:
-            all_ids.add(r['product']['id'])
-            for g in r.get('ingredients', []):
-                for i in g.get('item', []):
-                    all_ids.add(i['id'])
-        
-        # 2. API Call
-        with st.spinner(f"Fetching market data for {len(all_ids)} items..."):
-            market = get_market(all_ids, region)
-        
-        # 3. Calculate
-        results = []
-        for r in db:
-            pid = r['product']['id']
-            pname = r['product']['name']
-            
-            market_entry = market.get(pid, {})
-            sell_price = market_entry.get('p', 0)
-            
-            cost = 0
-            possible = True
-            missing = []
-            
-            for g in r.get('ingredients', []):
-                opts = g.get('item', [])
-                valid_prices = []
-                for o in opts:
-                    oid = o['id']
-                    if oid in market:
-                        if market[oid]['s'] >= min_stock:
-                            valid_prices.append(market[oid]['p'])
-                
-                if valid_prices:
-                    cost += (min(valid_prices) * g['amount'])
-                else:
-                    possible = False
-                    missing.append(opts[0]['name'] if opts else "?")
-            
-            # Profit Logic
-            y_mult = 2.5 if "Processing" in r['_src'] else 1.0 + (mastery/4000)*0.3 + 1.35
-            revenue = sell_price * y_mult * tax
-            profit = revenue - cost
-            
-            if sell_price > 0:
-                results.append({
-                    "Item": pname,
-                    "Profit/Hr": int(profit * 900),
-                    "Cost": int(cost),
-                    "Price": int(sell_price),
-                    "Stock": "✅" if possible else "❌",
-                    "Missing": ", ".join(missing[:2]),
-                    "Type": r['_src'].split(".")[0].replace("recipes", "")
-                })
+# --- ONE CLICK TEST BUTTON ---
+st.write("---")
+col_test, col_run = st.columns([1, 2])
 
-        # 4. Display
-        if results:
-            df = pd.DataFrame(results)
-            df = df.sort_values("Profit/Hr", ascending=False)
+with col_test:
+    if st.button("🧪 Test Connection (Beer)", type="secondary"):
+        with st.spinner("Testing connection to Arsha..."):
+            # Beer ID = 9213
+            test_res = get_market_threaded([9213], region)
+            if 9213 in test_res:
+                st.success(f"✅ SUCCESS! Beer Price: {test_res[9213]['p']:,} silver")
+                st.json(test_res)
+            else:
+                st.error("❌ Connection Failed. API might be down or Region is wrong.")
+
+with col_run:
+    if st.button("🚀 RUN FULL SCAN", type="primary"):
+        if not db:
+            st.error("No recipes.")
+        else:
+            all_ids = set()
+            for r in db:
+                all_ids.add(r['product']['id'])
+                for g in r.get('ingredients', []):
+                    for i in g.get('item', []):
+                        all_ids.add(i['id'])
             
-            st.success(f"Done! Analyzing {len(results)} profitable recipes.")
+            st.info(f"Targeting {len(all_ids)} unique items. Using 'Tank Mode' (Threaded Single Fetch)...")
+            market = get_market_threaded(all_ids, region)
             
-            st.dataframe(
-                df,
-                use_container_width=True,
-                column_config={
-                    "Profit/Hr": st.column_config.NumberColumn(format="%d silver"),
+            results = []
+            for r in db:
+                pid = r['product']['id']
+                pname = r['product']['name']
+                
+                market_entry = market.get(pid, {})
+                sell_price = market_entry.get('p', 0)
+                
+                cost = 0
+                possible = True
+                missing = []
+                
+                for g in r.get('ingredients', []):
+                    opts = g.get('item', [])
+                    valid_prices = []
+                    for o in opts:
+                        oid = o['id']
+                        if oid in market:
+                            if market[oid]['s'] >= min_stock:
+                                valid_prices.append(market[oid]['p'])
+                    
+                    if valid_prices:
+                        cost += (min(valid_prices) * g['amount'])
+                    else:
+                        possible = False
+                        missing.append(opts[0]['name'] if opts else "?")
+                
+                y_mult = 2.5 if "Processing" in r['_src'] else 1.0 + (mastery/4000)*0.3 + 1.35
+                revenue = sell_price * y_mult * tax
+                profit = revenue - cost
+                
+                if sell_price > 0:
+                    results.append({
+                        "Item": pname,
+                        "Profit/Hr": int(profit * 900),
+                        "Cost": int(cost),
+                        "Price": int(sell_price),
+                        "Stock": "✅" if possible else "❌",
+                        "Notes": f"Missing: {missing[0]}" if missing else ""
+                    })
+
+            if results:
+                df = pd.DataFrame(results).sort_values("Profit/Hr", ascending=False)
+                st.success(f"Generated data for {len(results)} items.")
+                st.dataframe(df, use_container_width=True, column_config={
+                    "Profit/Hr": st.column_config.NumberColumn(format="%d"),
                     "Cost": st.column_config.NumberColumn(format="%d"),
                     "Price": st.column_config.NumberColumn(format="%d"),
-                }
-            )
-        else:
-            st.error("No items found.")
-            st.warning("Check the 'Connection Debugger' section above. If Response is '[]', the API has no data for this region.")
+                })
+            else:
+                st.error("No items found. Try the Test button to verify connectivity.")
