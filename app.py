@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 import json
 
-st.set_page_config(page_title="BDO Global Market Scanner", layout="wide")
+st.set_page_config(page_title="BDO Master Scanner", layout="wide")
 st.title("🛡️ BDO Buy-to-Sell: Global Real-Time Scanner")
 
 # --- SETTINGS ---
@@ -18,8 +18,8 @@ with st.sidebar:
 # --- CORE FUNCTIONS ---
 @st.cache_data
 def load_full_database():
-    """Combines all available recipe files into one master list."""
     combined = []
+    # Ensure these match your GitHub file names exactly
     files = ["recipesCooking.json", "recipesAlchemy.json", "recipesProcessing.json"]
     for file in files:
         try:
@@ -32,10 +32,8 @@ def load_full_database():
     return combined
 
 def get_market_batch(ids):
-    """Fetches real-time market data from arsha.io in batches of 100."""
     id_list = list(map(str, ids))
     market_data = {}
-    # Arsha.io handles batch requests by joining IDs with commas
     for i in range(0, len(id_list), 100):
         batch = id_list[i:i+100]
         url = f"https://api.arsha.io/v1/{region}/price?id={','.join(batch)}"
@@ -51,32 +49,32 @@ db = load_full_database()
 
 if st.button("🚀 Run Global Profit Scan"):
     if not db:
-        st.error("No recipe files found. Ensure recipesCooking.json, recipesAlchemy.json, and recipesProcessing.json are in your repo.")
+        st.error("No recipe files found. Check your GitHub file names.")
     else:
-        # Collect all product and ingredient IDs across the entire database
+        # 1. Collect all product and ingredient IDs correctly
         all_item_ids = set()
-        for recipe in db:
-            all_item_ids.add(recipe['product']['id'])
-            for ing in recipe.get('ingredients', []):
+        for r in db:
+            all_item_ids.add(r['product']['id'])
+            for ing in r.get('ingredients', []):
                 for sub_item in ing.get('item', []):
                     all_item_ids.add(sub_item['id'])
         
-        st.write(f"📡 Querying market for {len(all_item_ids)} items...")
         market = get_market_batch(all_item_ids)
         results = []
 
-        for recipe in db:
-            prod_id = recipe['product']['id']
+        # 2. Match ingredients to market data
+        for r in db:
+            prod_id = r['product']['id']
             if prod_id not in market: continue
             
             sell_price, _ = market[prod_id]
             total_cost, in_stock = 0, True
             
-            # Check every ingredient for availability and cost
-            for ing in recipe.get('ingredients', []):
+            for ing in r.get('ingredients', []):
                 possible_items = ing.get('item', [])
-                # Strategy: Choose the cheapest available material from the group
-                available_options = [market[i['id']][0] for i in possible_items if i['id'] in market and market[i['id']][1] >= min_stock]
+                # Strategy: Choose the cheapest option currently in stock
+                available_options = [market[i['id']][0] for i in possible_items 
+                                    if i['id'] in market and market[i['id']][1] >= min_stock]
                 
                 if not available_options:
                     in_stock = False
@@ -84,30 +82,20 @@ if st.button("🚀 Run Global Profit Scan"):
                 total_cost += (min(available_options) * ing['amount'])
             
             if in_stock:
-                # Mastery Logic for 2025: Processing is flat 2.5x; Others scale
-                if "Processing" in recipe['source_file']:
-                    y_mult = 2.5
-                else:
-                    y_mult = 1.0 + (mastery/4000)*0.3 + 1.35
+                # Formula: Processing flat 2.5x; Others Mastery-based proc
+                y_mult = 2.5 if "Processing" in r['source_file'] else 1.0 + (mastery/4000)*0.3 + 1.35
+                profit = ((sell_price * y_mult) * tax) - total_cost
                 
-                # Formula: (Revenue * Tax) - Material Cost
-                profit_per_craft = ((sell_price * y_mult) * tax) - total_cost
-                # Baseline speed of 900 crafts per hour
                 results.append({
-                    "Item": recipe['product']['name'],
-                    "Category": recipe['source_file'].replace("recipes", "").replace(".json", ""),
-                    "Silver/Hr": profit_per_craft * 900
+                    "Item": r['product']['name'],
+                    "Category": r['source_file'].replace("recipes", "").replace(".json", ""),
+                    "Silver/Hr": profit * 900
                 })
 
-        # --- FINAL DISPLAY & SORTING ---
+        # 3. Safe Sorting Fix
         if results:
-            df = pd.DataFrame(results)
-            if "Silver/Hr" in df.columns:
-                df = df.sort_values(by="Silver/Hr", ascending=False)
-                st.success(f"Scan complete! Ranked {len(results)} items in stock.")
-                st.dataframe(
-                    df.style.format({"Silver/Hr": "{:,.0f}"}),
-                    use_container_width=True
-                )
+            df = pd.DataFrame(results).sort_values(by="Silver/Hr", ascending=False)
+            st.success(f"Scan complete! Ranked {len(results)} items in stock.")
+            st.dataframe(df.style.format({"Silver/Hr": "{:,.0f}"}), use_container_width=True)
         else:
-            st.warning("⚠️ 0 items found in stock. Try lowering the 'Min Component Stock' filter.")
+            st.warning("⚠️ 0 items found. Try lowering the 'Min Component Stock' filter to 1.")
