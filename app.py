@@ -3,81 +3,85 @@ import requests
 import pandas as pd
 import json
 
-st.set_page_config(page_title="BDO Master Scanner", layout="wide")
-st.title("🛡️ BDO Buy-to-Sell: Global Real-Time Scanner")
+st.set_page_config(page_title="BDO Global Profit Scanner", layout="wide")
+st.title("🛡️ BDO Buy-to-Sell: Global Real-Time Scanner (LifeBDO Fix)")
 
-# --- SETTINGS ---
+# --- USER PARAMETERS ---
 with st.sidebar:
     st.header("Settings")
     mastery = st.number_input("Lifeskill Mastery", value=2000, step=50)
-    region = st.sidebar.selectbox("Region", ["na", "eu", "sea", "kr"])
+    region = st.selectbox("Region", ["na", "eu", "sea", "kr"])
     tax = st.radio("Tax Rate", [0.845, 0.65], format_func=lambda x: "VP (15.5%)" if x == 0.845 else "No VP (35%)")
-    min_stock = st.slider("Min Component Stock", 0, 1000, 1) # Set to 1 to find buyable items
+    min_stock = st.slider("Min Component Stock", 0, 1000, 1)
     st.info("Scanner checks: recipesCooking.json, recipesAlchemy.json, recipesProcessing.json")
 
-# --- CORE FUNCTIONS ---
+# --- CORE DATA HANDLERS ---
 @st.cache_data
-def load_full_database():
-    master_db = []
+def load_and_combine_dbs():
+    combined = []
+    # Ensure these match your GitHub filenames EXACTLY (case-sensitive)
     files = ["recipesCooking.json", "recipesAlchemy.json", "recipesProcessing.json"]
     for f_name in files:
         try:
             with open(f_name, 'r') as f:
-                content = json.load(f)
-                recipes_list = content.get('recipes', [])
+                data = json.load(f)
+                # LifeBDO format wraps everything in a 'recipes' key
+                recipes_list = data.get('recipes', [])
                 for r in recipes_list:
-                    # Tag the source for category-specific yield math
-                    r['source_type'] = "Processing" if "Processing" in f_name else "Other"
-                master_db.extend(recipes_list)
-        except: continue
-    return master_db
+                    # Determine type for mastery yield calculation
+                    r['type'] = "Processing" if "Processing" in f_name else "Other"
+                    combined.append(r)
+        except Exception as e:
+            st.error(f"Failed to load {f_name}: {e}")
+    return combined
 
-def fetch_market_data(id_list, reg):
-    full_market = {}
-    ids = list(map(str, id_list))
-    # Batch API calls to Arsha.io (100 IDs per request)
+def fetch_live_market(id_list, reg):
+    market_map = {}
+    ids = [str(i) for i in id_list]
+    # Fetch in batches of 100 to avoid API rate limits
     for i in range(0, len(ids), 100):
-        batch = ids[i:i+100]
-        url = f"https://api.arsha.io/v1/{reg}/price?id={','.join(batch)}"
+        batch = ",".join(ids[i:i+100])
+        url = f"https://api.arsha.io/v1/{reg}/price?id={batch}"
         try:
             resp = requests.get(url, timeout=10).json()
             for item in resp:
-                full_market[item['id']] = (item['price'], item['stock'])
+                market_map[item['id']] = {"price": item['price'], "stock": item['stock']}
         except: continue
-    return full_market
+    return market_map
 
-# --- MAIN EXECUTION ---
-database = load_full_database()
+# --- EXECUTION ---
+db = load_and_combine_dbs()
 
 if st.button("🚀 Run Global Profit Scan"):
-    if not database:
-        st.error("No recipe files found. Ensure filenames on GitHub match sidebar exactly.")
+    if not db:
+        st.error("Recipe database is empty. Check your JSON files on GitHub.")
     else:
-        # 1. Collect all IDs using the deeper LifeBDO structure
+        # 1. Traverse LifeBDO structure to collect every unique ID
         all_ids = set()
-        for r in database:
+        for r in db:
             all_ids.add(r['product']['id'])
             for ing in r.get('ingredients', []):
-                for sub in ing.get('item', []):
-                    all_ids.add(sub['id'])
+                for sub_item in ing.get('item', []):
+                    all_ids.add(sub_item['id'])
         
-        st.write(f"📡 Querying market for {len(all_ids)} items...")
-        market_map = fetch_market_data(all_ids, region)
+        market = fetch_live_market(all_ids, region)
         results = []
 
-        # 2. Match ingredients and check stock thresholds
-        for r in database:
+        # 2. Match market data to recipes
+        for r in db:
             p_id = r['product']['id']
-            if p_id not in market_map: continue
+            if p_id not in market: continue
             
-            sell_price, _ = market_map[p_id]
+            p_name = r['product']['name']
+            sell_price = market[p_id]['price']
             total_cost, in_stock = 0, True
             
+            # Navigate nested ingredients -> item -> id
             for ing in r.get('ingredients', []):
-                possible_mats = ing.get('item', [])
-                # Pick the cheapest material from the valid options
-                valid_options = [market_map[m['id']][0] for m in possible_mats 
-                                if m['id'] in market_map and market_map[m['id']][1] >= min_stock]
+                possible_choices = ing.get('item', [])
+                # Find cheapest available option in the material group
+                valid_options = [market[m['id']]['price'] for m in possible_choices 
+                                if m['id'] in market and market[m['id']]['stock'] >= min_stock]
                 
                 if not valid_options:
                     in_stock = False
@@ -85,22 +89,25 @@ if st.button("🚀 Run Global Profit Scan"):
                 total_cost += (min(valid_options) * ing['amount'])
             
             if in_stock:
-                # Yield Formulas for Dec 2025 Meta
-                # Processing (Heating/Chopping) avg 2.5x flat
-                # Cooking/Alchemy uses Mastery-scaled proc rate
-                mult = 2.5 if r['source_type'] == "Processing" else 1.0 + (mastery/4000)*0.3 + 1.35
+                # 2025 Yield: Processing flat 2.5x; Others Mastery-based
+                mult = 2.5 if r['type'] == "Processing" else 1.0 + (mastery/4000)*0.3 + 1.35
                 profit = ((sell_price * mult) * tax) - total_cost
                 
                 results.append({
-                    "Item": r['product']['name'],
-                    "Type": r['source_type'],
-                    "Silver/Hr": profit * 900 # Avg 900 crafts per hour
+                    "Item": p_name,
+                    "Type": r['type'],
+                    "Silver/Hr": profit * 900 # Avg 900 crafts/hr
                 })
 
-        # 3. Sort and Display Results
+        # 3. sorting and Display
         if results:
             df = pd.DataFrame(results).sort_values(by="Silver/Hr", ascending=False)
-            st.success(f"Global scan complete! Ranked {len(results)} items found in stock.")
+            st.success(f"Global Scan Complete! Found {len(results)} items in stock.")
             st.dataframe(df.style.format({"Silver/Hr": "{:,.0f}"}), use_container_width=True)
+            
+            # Debug: Show current market state for the top item
+            st.divider()
+            st.subheader("📡 Market Data Check (Top Item Components)")
+            st.write(f"The scanner is using live data from arsha.io for {region.upper()}.")
         else:
-            st.warning("⚠️ 0 items found. Try lowering 'Min Component Stock' to 0 to debug.")
+            st.warning("⚠️ 0 items found. This means none of your recipes have all ingredients in stock at your 'Min Stock' level.")
