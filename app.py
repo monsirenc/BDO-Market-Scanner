@@ -1,38 +1,33 @@
 import streamlit as st
-import requests
+import cloudscraper
 import pandas as pd
 import json
 import time
-import urllib3
+import re
 
-# Suppress SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-st.set_page_config(page_title="BDO Category Scanner", layout="wide")
-st.title("🛡️ BDO Global Scanner (Category Mode)")
+st.set_page_config(page_title="BDO Official Scanner", layout="wide")
+st.title("🛡️ BDO Global Scanner (Official Source Mode)")
 
 # --- CONFIG ---
-# These are the BDO Market Category IDs we need to build our database
-# Format: (MainCategory, SubCategory, Name)
-# 25=Material, 35=Consumable
-CATEGORIES_TO_SCAN = [
-    (25, 1, "Ores & Gems"),
-    (25, 2, "Plants & Grains"),
-    (25, 6, "Meats & Bloods"),
-    (25, 7, "Processed Materials"), # Dough, Flour, Planks, Ingots
-    (25, 8, "Timber"),
-    (35, 1, "Food & Meals"),       # Cooking products
-    (35, 2, "Potions & Elixirs"),  # Alchemy products
-    (35, 6, "Pet Feed")
-]
+# Initialize Cloudscraper to bypass Pearl Abyss security
+scraper = cloudscraper.create_scraper()
+
+# Official Market URL map
+REGIONS = {
+    "NA": "https://trade.na.playblackdesert.com",
+    "EU": "https://trade.eu.playblackdesert.com",
+    "SEA": "https://trade.sea.playblackdesert.com",
+    "KR": "https://trade.kr.playblackdesert.com",
+    "RU": "https://trade.ru.playblackdesert.com",
+    "JP": "https://trade.jp.playblackdesert.com"
+}
 
 # --- SETTINGS ---
 col1, col2, col3 = st.columns(3)
 with col1:
     mastery = st.number_input("Mastery", 2000, step=50)
 with col2:
-    # Lowercase usually best for this endpoint
-    region = st.selectbox("Region", ["na", "eu", "sea", "kr", "sa", "ru", "jp"])
+    region_code = st.selectbox("Region", list(REGIONS.keys()))
 with col3:
     min_stock = st.number_input("Min Stock", 0, step=10)
 
@@ -65,104 +60,147 @@ def load_data_strict():
             log.append(f"❌ {f}: Failed - {e}")
     return db, log
 
-# --- 2. CATEGORY API FETCH (The New Way) ---
-def fetch_market_by_category(reg):
-    market = {}
+# --- 2. OFFICIAL API HANDLER ---
+def get_official_tokens(base_url):
+    """
+    Hits the homepage to get the __RequestVerificationToken and Cookies
+    """
+    try:
+        # Hit the home page to establish session
+        resp = scraper.get(f"{base_url}/Home/list/hot", timeout=10)
+        
+        if resp.status_code != 200:
+            return None, f"Status {resp.status_code}"
+            
+        # Extract the hidden token using regex
+        # <input name="__RequestVerificationToken" type="hidden" value="..." />
+        match = re.search(r'name="__RequestVerificationToken" type="hidden" value="([^"]+)"', resp.text)
+        if match:
+            return match.group(1), "Success"
+        else:
+            return None, "Token not found in HTML"
+            
+    except Exception as e:
+        return None, str(e)
+
+def fetch_official_category(base_url, token, main_cat, sub_cat):
+    """
+    Uses the token to POST to the official API endpoint
+    """
+    api_url = f"{base_url}/Trademarket/GetWorldMarketSubList"
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "__RequestVerificationToken": token,
+        "X-Requested-With": "XMLHttpRequest"
     }
     
-    # Progress UI
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    payload = {
+        "mainCategory": main_cat,
+        "subCategory": sub_cat,
+        "keyWord": "" # Empty keyword returns full list
+    }
     
-    total_cats = len(CATEGORIES_TO_SCAN)
-    
-    for idx, (main_cat, sub_cat, cat_name) in enumerate(CATEGORIES_TO_SCAN):
-        status_text.text(f"Fetching Category: {cat_name}...")
+    try:
+        # Important: We must use the scraper object to keep the cookies from the first request
+        resp = scraper.post(api_url, headers=headers, json=payload, timeout=10)
         
-        # Endpoint: GetWorldMarketSubList
-        url = f"https://api.arsha.io/v2/{reg}/GetWorldMarketSubList?mainCategory={main_cat}&subCategory={sub_cat}&lang=en"
-        
-        try:
-            # We use verify=False to ignore SSL errors on Streamlit Cloud
-            resp = requests.get(url, headers=headers, timeout=10, verify=False)
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                # Depending on API version, sometimes it's a list, sometimes a dict key
-                # Arsha V2 List usually: [{"id": 123, "name": "Ore", "pricePerOne": 500, ...}, ...]
-                
-                # Check format
-                items_list = []
-                if isinstance(data, list):
-                    items_list = data
-                elif isinstance(data, dict) and 'detailList' in data:
-                    items_list = data['detailList']
-                
-                # Process the batch
-                count = 0
-                for item in items_list:
-                    # Safe extraction
-                    try:
-                        pid = int(item.get('id', 0))
-                        price = int(item.get('pricePerOne', 0))
-                        stock = int(item.get('count', 0)) # Note: key might be 'count' or 'currentStock'
-                        
-                        # Fallback for stock key
-                        if stock == 0 and 'currentStock' in item:
-                            stock = int(item['currentStock'])
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except:
+        return None
 
-                        if pid != 0:
-                            market[pid] = {'p': price, 's': stock}
-                            count += 1
-                    except: pass
-                
-                # print(f"  -> Got {count} items from {cat_name}")
-                
-            else:
-                st.warning(f"Failed to fetch {cat_name} (Code {resp.status_code})")
-                
-        except Exception as e:
-            st.error(f"Error fetching {cat_name}: {e}")
+def get_market_official(reg_code):
+    market = {}
+    base_url = REGIONS[reg_code]
+    
+    # 1. Authenticate (Get Token)
+    status_text = st.empty()
+    status_text.text("Authenticating with Official BDO Server...")
+    
+    token, msg = get_official_tokens(base_url)
+    
+    if not token:
+        st.error(f"Failed to authenticate with Pearl Abyss: {msg}")
+        return {}
+    
+    st.toast(f"Authenticated! Token: {token[:10]}...")
+    
+    # 2. Define Categories to Scan
+    # 25=Material, 35=Consumable
+    # We need to map recipe needs to official category IDs
+    cats = [
+        (35, 1, "Food"), (35, 2, "Potions"), (35, 6, "Pet Feed"),
+        (25, 6, "Meat/Blood"), (25, 2, "Plants"), (25, 1, "Ore"), 
+        (25, 7, "Processed"), (25, 8, "Timber")
+    ]
+    
+    bar = st.progress(0)
+    
+    for i, (main, sub, name) in enumerate(cats):
+        status_text.text(f"Scraping Official Category: {name}...")
+        
+        data = fetch_official_category(base_url, token, main, sub)
+        
+        if data and 'resultCode' in data and data['resultCode'] == 0:
+            # Parse the weird string format BDO uses sometimes, OR standard JSON
+            # Official API usually returns: {"resultMsg": "...", "resultResult": [ { "mainKey": 123, "pricePerOne": 500, "count": 999 } ]}
+            items = data.get('resultResult', [])
             
-        # Update Progress
-        progress_bar.progress((idx + 1) / total_cats)
+            for item in items:
+                try:
+                    # Official API Keys: mainKey = ID, pricePerOne = Price, count = Stock
+                    pid = int(item.get('mainKey', 0))
+                    price = int(item.get('pricePerOne', 0))
+                    stock = int(item.get('count', 0))
+                    
+                    if pid != 0:
+                        market[pid] = {'p': price, 's': stock}
+                except: pass
+        else:
+            # st.warning(f"Skipped {name}")
+            pass
+            
+        bar.progress((i + 1) / len(cats))
         time.sleep(0.5) # Polite delay
         
-    progress_bar.empty()
+    bar.empty()
     status_text.empty()
     return market
 
-# --- 3. MAIN APP ---
+# --- 3. MAIN LOGIC ---
 db, logs = load_data_strict()
 
 with st.expander("System Status", expanded=False):
     for l in logs:
         st.write(l)
 
-# --- ONE BUTTON TO RULE THEM ALL ---
-if st.button("🚀 RUN CATEGORY SCAN", type="primary"):
+# DIAGNOSTIC
+if st.button("🧪 Test Official Connection"):
+    url = REGIONS[region_code]
+    tok, msg = get_official_tokens(url)
+    if tok:
+        st.success(f"Connected to {url}! Token acquired.")
+    else:
+        st.error(f"Could not connect to {url}. Reason: {msg}")
+
+# RUN
+if st.button("🚀 RUN SCAN (OFFICIAL)", type="primary"):
     if not db:
         st.error("No recipes.")
     else:
-        # 1. Fetch Market Data (Bulk Mode)
-        st.info("Fetching entire market categories. This avoids 'Bad ID' crashes.")
-        market = fetch_market_by_category(region)
+        market = get_market_official(region_code)
         
         if not market:
-            st.error("Market data empty. The API Region might be down entirely.")
+            st.error("Scan failed. The official site might be blocking Cloud IPs.")
         else:
-            st.success(f"Successfully cached {len(market)} market prices!")
-            
-            # 2. Calculate Profits
+            # Profit Calc (Same as before)
             results = []
             for r in db:
                 pid = r['product']['id']
                 pname = r['product']['name']
-                
-                # If product not in market (e.g. Imperial Delivery items), price is 0
                 market_entry = market.get(pid, {})
                 sell_price = market_entry.get('p', 0)
                 
@@ -170,33 +208,25 @@ if st.button("🚀 RUN CATEGORY SCAN", type="primary"):
                 possible = True
                 missing = []
                 
-                # Loop Ingredients
                 for g in r.get('ingredients', []):
                     opts = g.get('item', [])
                     valid_prices = []
-                    
-                    # Vendor Item Logic (If item ID is known vendor trash, assume price 0 or skip)
-                    # We assume vendor items are "Free" or handled externally for this simple calc
-                    # But if it's a market item, we look it up.
-                    
                     for o in opts:
-                        oid = o['id']
-                        # Check market DB
-                        if oid in market:
-                            if market[oid]['s'] >= min_stock:
-                                valid_prices.append(market[oid]['p'])
-                        # Fallback: If it's a vendor item (id < 1000 usually not strictly true but useful heuristc)
-                        # or specifically known like mineral water (9059)
-                        elif oid in [9059, 9001, 9002, 9005, 5600]:
-                             valid_prices.append(50) # Assign dummy low cost for vendor mats
-                    
+                        # Vendors
+                        if o['id'] in [5600, 9059, 9001, 9002, 9005]:
+                            valid_prices.append(50) 
+                            continue
+                            
+                        if o['id'] in market:
+                            if market[o['id']]['s'] >= min_stock:
+                                valid_prices.append(market[o['id']]['p'])
+                                
                     if valid_prices:
                         cost += (min(valid_prices) * g['amount'])
                     else:
                         possible = False
                         missing.append(opts[0]['name'] if opts else "?")
                 
-                # Profit Calc
                 y_mult = 2.5 if "Processing" in r['_src'] else 1.0 + (mastery/4000)*0.3 + 1.35
                 revenue = sell_price * y_mult * tax
                 profit = revenue - cost
@@ -208,20 +238,11 @@ if st.button("🚀 RUN CATEGORY SCAN", type="primary"):
                         "Cost": int(cost),
                         "Price": int(sell_price),
                         "Stock": "✅" if possible else "❌",
-                        "Missing": ", ".join(missing[:2])
+                        "Missing": missing[0] if missing else ""
                     })
 
-            # 3. Display
             if results:
                 df = pd.DataFrame(results).sort_values("Profit/Hr", ascending=False)
-                st.dataframe(
-                    df,
-                    use_container_width=True,
-                    column_config={
-                        "Profit/Hr": st.column_config.NumberColumn(format="%d"),
-                        "Cost": st.column_config.NumberColumn(format="%d"),
-                        "Price": st.column_config.NumberColumn(format="%d"),
-                    }
-                )
+                st.dataframe(df, use_container_width=True)
             else:
-                st.warning("No profitable recipes found (or prices missing for products).")
+                st.warning("No matches found. (Note: Only scanned main categories Food/Mats)")
